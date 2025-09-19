@@ -623,3 +623,125 @@
     (map-get? popular-markets u4)
     (map-get? popular-markets u5)
   ))
+
+;; Market search index by keyword
+(define-map keyword-markets
+  (string-ascii 20)
+  (list 50 uint))
+
+;; AMM constants
+(define-constant amm-fee-percentage u5) ;; 0.5% fee
+(define-constant amm-initial-liquidity u1000000) ;; 1000 STX minimum initial liquidity
+
+;; AMM pool details
+(define-map amm-pools
+  uint  ;; market-id
+  {
+    constant-product: uint,
+    yes-pool: uint,
+    no-pool: uint,
+    lp-tokens: uint,
+    fee-collected: uint
+  })
+
+;; AMM LP token balances
+(define-map amm-lp-balances
+  { market-id: uint, provider: principal }
+  { tokens: uint })
+
+;; Initialize AMM for binary market
+(define-public (initialize-amm-pool (market-id uint) (yes-amount uint) (no-amount uint))
+  (let ((market (unwrap! (map-get? markets market-id) error-invalid-market))
+        (outcome-type (get outcome-type market))
+        (possible-outcomes (get possible-outcomes market)))
+    
+    ;; Verify this is a binary market with yes/no outcomes
+    (asserts! (and (is-eq outcome-type 0x01)
+                   (is-eq (len possible-outcomes) u2)) error-invalid-market)
+    
+    ;; Ensure minimum liquidity
+    (asserts! (and (>= yes-amount amm-initial-liquidity)
+                   (>= no-amount amm-initial-liquidity)) error-invalid-amount)
+    
+    ;; Calculate constant product
+    (let ((constant-product (* yes-amount no-amount))
+          (lp-tokens (sqrti constant-product)))
+      
+      ;; Transfer STX to contract
+      (try! (stx-transfer? (+ yes-amount no-amount) tx-sender (as-contract tx-sender)))
+      
+      ;; Set initial AMM state
+      (map-set amm-pools market-id {
+        constant-product: constant-product,
+        yes-pool: yes-amount,
+        no-pool: no-amount,
+        lp-tokens: lp-tokens,
+        fee-collected: u0
+      })
+      
+      ;; Assign LP tokens to provider
+      (map-set amm-lp-balances 
+        { market-id: market-id, provider: tx-sender }
+        { tokens: lp-tokens })
+      
+      (ok lp-tokens))))
+
+;; Swap function for binary markets
+(define-public (amm-swap (market-id uint) (input-outcome (string-ascii 50)) (amount uint))
+  (let ((pool (unwrap! (map-get? amm-pools market-id) error-invalid-market))
+        (market (unwrap! (map-get? markets market-id) error-invalid-market))
+        (yes-pool (get yes-pool pool))
+        (no-pool (get no-pool pool))
+        (constant-product (get constant-product pool)))
+    
+    ;; Check market is active
+    (asserts! (is-eq (get status market) 0x01) error-invalid-state)
+    
+    ;; Calculate swap based on input outcome
+    (if (is-eq input-outcome "Yes")
+      ;; Swapping Yes -> No
+      (let ((fee-amount (/ (* amount amm-fee-percentage) u1000))
+            (amount-after-fee (- amount fee-amount))
+            (new-yes-pool (+ yes-pool amount-after-fee))
+            (new-no-pool (/ constant-product new-yes-pool))
+            (output-amount (- no-pool new-no-pool)))
+        
+        ;; Transfer input amount from user
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        ;; Transfer output amount to user
+        (as-contract (try! (stx-transfer? output-amount tx-sender tx-sender)))
+        
+        ;; Update pool state
+        (map-set amm-pools market-id
+          (merge pool {
+            yes-pool: new-yes-pool,
+            no-pool: new-no-pool,
+            fee-collected: (+ (get fee-collected pool) fee-amount)
+          }))
+        
+        (ok { input: amount, output: output-amount, fee: fee-amount }))
+        
+      ;; Swapping No -> Yes  
+      (let ((fee-amount (/ (* amount amm-fee-percentage) u1000))
+            (amount-after-fee (- amount fee-amount))
+            (new-no-pool (+ no-pool amount-after-fee))
+            (new-yes-pool (/ constant-product new-no-pool))
+            (output-amount (- yes-pool new-yes-pool)))
+        
+        ;; Transfer input amount from user
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        ;; Transfer output amount to user
+        (as-contract (try! (stx-transfer? output-amount tx-sender tx-sender)))
+        
+        ;; Update pool state
+        (map-set amm-pools market-id
+          (merge pool {
+            yes-pool: new-yes-pool,
+            no-pool: new-no-pool,
+            fee-collected: (+ (get fee-collected pool) fee-amount)
+          }))
+        
+        (ok { input: amount, output: output-amount, fee: fee-amount })))))
+
